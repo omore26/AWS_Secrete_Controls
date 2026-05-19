@@ -3,11 +3,13 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: Create Lambda, AWS Config rule, SSM remediation, and IAM roles for EC2 public IP control
 
 Resources:
-
+# Role for the Detective Lambda
   DetectiveLambdaRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: PublicEC2DetectiveLambdaRole
+
+  # Allows Lambda service to use this role
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -15,18 +17,22 @@ Resources:
             Principal:
               Service: lambda.amazonaws.com
             Action: sts:AssumeRole
+
+      # Basic Lambda Logs Permissions
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
       Policies:
         - PolicyName: DetectiveLambdaConfigPolicy
           PolicyDocument:
             Version: "2012-10-17"
+
+            # Allows Lambda to Send compliance result to AWS Config
             Statement:
               - Effect: Allow
                 Action:
                   - config:PutEvaluations
                 Resource: "*"
-
+# Role for reactive lambda
   ReactiveLambdaRole:
     Type: AWS::IAM::Role
     Properties:
@@ -45,6 +51,8 @@ Resources:
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
+
+            # Permissions to check and modify EC2 Instances
               - Effect: Allow
                 Action:
                   - ec2:DescribeInstances
@@ -53,12 +61,15 @@ Resources:
                   - ec2:StopInstances
                 Resource: "*"
 
+# Detective lambda to check if the EC2 has Public IP
   PublicEC2DetectiveLambda:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: public-ec2-detective-control-1
       Runtime: python3.12
       Handler: index.lambda_handler
+      
+      # Attaching the IAM role created for Detective Lambda
       Role:
         Fn::GetAtt:
           - DetectiveLambdaRole
@@ -69,15 +80,19 @@ Resources:
           import boto3
           import json
 
+          # Connect to AWS Config
           config = boto3.client("config")
 
           def lambda_handler(event, context):
+
+              # Read EC2 instance event details
               invoking_event = json.loads(event["invokingEvent"])
               config_item = invoking_event["configurationItem"]
 
               resource_type = config_item["resourceType"]
               resource_id = config_item["resourceId"]
-
+              
+              # Assuming EC2 instance is Safe
               compliance_type = "COMPLIANT"
               annotation = "EC2 instance is not publicly accessible."
 
@@ -88,10 +103,12 @@ Resources:
                   configuration = config_item.get("configuration", {})
                   public_ip = configuration.get("publicIpAddress")
 
+                  # Check if public IP Exist
                   if public_ip:
                       compliance_type = "NON_COMPLIANT"
                       annotation = f"EC2 instance has public IP address: {public_ip}"
 
+              # Send result back to AWS Config
               config.put_evaluations(
                   Evaluations=[
                       {
@@ -105,6 +122,7 @@ Resources:
                   ResultToken=event["resultToken"],
               )
 
+  # Reactive Lambda to remove public access and stops EC2
   PublicEC2ReactiveLambda:
     Type: AWS::Lambda::Function
     Properties:
@@ -127,12 +145,14 @@ Resources:
               if isinstance(event, str):
                   event = json.loads(event)
 
+              # Get Instance ID
               instance_id = event.get("InstanceId") or event.get("ResourceId") or event.get("RESOURCE_ID")
 
               if not instance_id:
                   return {"status": "FAILED", "message": "Instance ID was not provided."}
 
               try:
+                  # Read EC2 instance details
                   response = ec2.describe_instances(InstanceIds=[instance_id])
                   instance = response["Reservations"][0]["Instances"][0]
 
@@ -141,6 +161,7 @@ Resources:
                   if not public_ip:
                       return {"status": "SUCCESS", "message": "Instance does not have a public IP."}
 
+                  # Finds Elastic IP
                   addresses = ec2.describe_addresses(
                       Filters=[
                           {
@@ -150,12 +171,14 @@ Resources:
                       ]
                   )
 
+                  # Disconnect Public IP
                   for address in addresses.get("Addresses", []):
                       association_id = address.get("AssociationId")
 
                       if association_id:
                           ec2.disassociate_address(AssociationId=association_id)
 
+                  # Stops EC2 Instance 
                   ec2.stop_instances(InstanceIds=[instance_id])
 
                   return {
@@ -166,10 +189,13 @@ Resources:
               except Exception as error:
                   return {"status": "FAILED", "message": str(error)}
 
+  # Role for SSM Automation to allow SSM to execute remidiation action
   PublicEC2RemediationRole:
     Type: AWS::IAM::Role
     Properties:
       RoleName: PublicEC2RemediationRole
+      
+      # Allow SSM Service to use this role
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
         Statement:
@@ -177,12 +203,16 @@ Resources:
             Principal:
               Service: ssm.amazonaws.com
             Action: sts:AssumeRole
+
+      # Give SSM Automation default permissions
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
       Policies:
         - PolicyName: PublicEC2RemediationPolicy
           PolicyDocument:
             Version: "2012-10-17"
+           
+          #  Allow SSM to run reactive lambda
             Statement:
               - Effect: Allow
                 Action:
@@ -191,7 +221,7 @@ Resources:
                   Fn::GetAtt:
                     - PublicEC2ReactiveLambda
                     - Arn
-
+  # SSM Automation documents is the rapir instruction
   PublicEC2RemediationDocument:
     Type: AWS::SSM::Document
     Properties:
@@ -203,9 +233,11 @@ Resources:
         description: "Runs Lambda to remediate public EC2 instances"
         assumeRole: "{{ AutomationAssumeRole }}"
         parameters:
+          # Roles Passed during Execution
           AutomationAssumeRole:
             type: String
             description: "Role used by SSM Automation"
+          # EC2 Instance to fix
           InstanceId:
             type: String
             description: "EC2 instance ID to remediate"
@@ -217,6 +249,7 @@ Resources:
                 Ref: PublicEC2ReactiveLambda
               Payload: '{"InstanceId":"{{ InstanceId }}"}'
 
+  # Allow AWS Config to Call Detective Lambda
   PublicEC2DetectiveLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -225,6 +258,7 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: config.amazonaws.com
 
+  # Allow AWS SSM to Call Reactive Lambda
   PublicEC2ReactiveLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -233,6 +267,8 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: ssm.amazonaws.com
 
+  
+  # AWS Config Rule which continuosly checks EC2 Instances
   PublicEC2DetectiveRule:
     Type: AWS::Config::ConfigRule
     DependsOn:
@@ -253,6 +289,7 @@ Resources:
           - EventSource: aws.config
             MessageType: ConfigurationItemChangeNotification
 
+  # Automatic Remediation Configuration to start fixing automatically if its NON-COMPLIANT
   PublicEC2ReactiveRemediation:
     Type: AWS::Config::RemediationConfiguration
     DependsOn:
@@ -261,8 +298,10 @@ Resources:
       - PublicEC2DetectiveRule
       - PublicEC2ReactiveLambdaPermission
     Properties:
+      # Rule to Monitor 
       ConfigRuleName:
         Ref: PublicEC2DetectiveRule
+      # Use SSM Document
       TargetType: SSM_DOCUMENT
       TargetId:
         Ref: PublicEC2RemediationDocument
