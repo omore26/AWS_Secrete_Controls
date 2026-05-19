@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Create Lambda, AWS Config rule, SSM remediation, and IAM roles for EC2 public IP control
+
+Resources:
+
+  DetectiveLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PublicEC2DetectiveLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DetectiveLambdaConfigPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - config:PutEvaluations
+                Resource: "*"
+
+  ReactiveLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PublicEC2ReactiveLambdaRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReactiveLambdaEC2Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeAddresses
+                  - ec2:DisassociateAddress
+                  - ec2:StopInstances
+                Resource: "*"
+
+  PublicEC2DetectiveLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: public-ec2-detective-control-1
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - DetectiveLambdaRole
+          - Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          config = boto3.client("config")
+
+          def lambda_handler(event, context):
+              invoking_event = json.loads(event["invokingEvent"])
+              config_item = invoking_event["configurationItem"]
+
+              resource_type = config_item["resourceType"]
+              resource_id = config_item["resourceId"]
+
+              compliance_type = "COMPLIANT"
+              annotation = "EC2 instance is not publicly accessible."
+
+              if resource_type != "AWS::EC2::Instance":
+                  compliance_type = "NOT_APPLICABLE"
+                  annotation = "This rule only checks EC2 instances."
+              else:
+                  configuration = config_item.get("configuration", {})
+                  public_ip = configuration.get("publicIpAddress")
+
+                  if public_ip:
+                      compliance_type = "NON_COMPLIANT"
+                      annotation = f"EC2 instance has public IP address: {public_ip}"
+
+              config.put_evaluations(
+                  Evaluations=[
+                      {
+                          "ComplianceResourceType": resource_type,
+                          "ComplianceResourceId": resource_id,
+                          "ComplianceType": compliance_type,
+                          "Annotation": annotation,
+                          "OrderingTimestamp": config_item["configurationItemCaptureTime"],
+                      }
+                  ],
+                  ResultToken=event["resultToken"],
+              )
+
+  PublicEC2ReactiveLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: public-ec2-reactive-control-1
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+          - ReactiveLambdaRole
+          - Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          ec2 = boto3.client("ec2")
+
+          def lambda_handler(event, context):
+              if isinstance(event, str):
+                  event = json.loads(event)
+
+              instance_id = event.get("InstanceId") or event.get("ResourceId") or event.get("RESOURCE_ID")
+
+              if not instance_id:
+                  return {"status": "FAILED", "message": "Instance ID was not provided."}
+
+              try:
+                  response = ec2.describe_instances(InstanceIds=[instance_id])
+                  instance = response["Reservations"][0]["Instances"][0]
+
+                  public_ip = instance.get("PublicIpAddress")
+
+                  if not public_ip:
+                      return {"status": "SUCCESS", "message": "Instance does not have a public IP."}
+
+                  addresses = ec2.describe_addresses(
+                      Filters=[
+                          {
+                              "Name": "public-ip",
+                              "Values": [public_ip]
+                          }
+                      ]
+                  )
+
+                  for address in addresses.get("Addresses", []):
+                      association_id = address.get("AssociationId")
+
+                      if association_id:
+                          ec2.disassociate_address(AssociationId=association_id)
+
+                  ec2.stop_instances(InstanceIds=[instance_id])
+
+                  return {
+                      "status": "SUCCESS",
+                      "message": f"Public access removed and instance stopped: {instance_id}"
+                  }
+
+              except Exception as error:
+                  return {"status": "FAILED", "message": str(error)}
+
+  PublicEC2RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: PublicEC2RemediationRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: PublicEC2RemediationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  Fn::GetAtt:
+                    - PublicEC2ReactiveLambda
+                    - Arn
+
+  PublicEC2RemediationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Name: PublicEC2RemediationDocument
+      Content:
+        schemaVersion: "0.3"
+        description: "Runs Lambda to remediate public EC2 instances"
+        assumeRole: "{{ AutomationAssumeRole }}"
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: "Role used by SSM Automation"
+          InstanceId:
+            type: String
+            description: "EC2 instance ID to remediate"
+        mainSteps:
+          - name: InvokeReactiveLambda
+            action: aws:invokeLambdaFunction
+            inputs:
+              FunctionName:
+                Ref: PublicEC2ReactiveLambda
+              Payload: '{"InstanceId":"{{ InstanceId }}"}'
+
+  PublicEC2DetectiveLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: PublicEC2DetectiveLambda
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+
+  PublicEC2ReactiveLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Ref: PublicEC2ReactiveLambda
+      Action: lambda:InvokeFunction
+      Principal: ssm.amazonaws.com
+
+  PublicEC2DetectiveRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn:
+      - PublicEC2DetectiveLambdaPermission
+    Properties:
+      ConfigRuleName: public-ec2-detective-control-1
+      Description: Detects EC2 instances that have public IP addresses
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier:
+          Fn::GetAtt:
+            - PublicEC2DetectiveLambda
+            - Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ConfigurationItemChangeNotification
+
+  PublicEC2ReactiveRemediation:
+    Type: AWS::Config::RemediationConfiguration
+    DependsOn:
+      - PublicEC2RemediationRole
+      - PublicEC2RemediationDocument
+      - PublicEC2DetectiveRule
+      - PublicEC2ReactiveLambdaPermission
+    Properties:
+      ConfigRuleName:
+        Ref: PublicEC2DetectiveRule
+      TargetType: SSM_DOCUMENT
+      TargetId:
+        Ref: PublicEC2RemediationDocument
+      Automatic: true
+      MaximumAutomaticAttempts: 1
+      RetryAttemptSeconds: 60
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - Fn::GetAtt:
+                  - PublicEC2RemediationRole
+                  - Arn
+        InstanceId:
+          ResourceValue:
+            Value: RESOURCE_ID
